@@ -2,6 +2,11 @@
 
 import re
 
+# 后端（copilot / workbuddy）要求 messages[0] 必须是 system prompt，
+# 否则直接返回 11128 "first message is not system prompt"。
+# 因此：过滤后若 system 内容为空，用中性占位替换，而不是整条丢弃。
+_SYSTEM_FALLBACK = "You are a helpful assistant."
+
 
 _DECLARATION = re.compile(
     r"^(?:you\s+are\b|your\s+(?:designated\s+)?identity\b|"
@@ -64,8 +69,9 @@ def filter_system_identity(body: dict) -> dict:
         content = message.get("content")
         if isinstance(content, str):
             filtered = filter_system_text(content)
-            if filtered.strip():
-                messages.append(dict(message, content=filtered))
+            messages.append(
+                dict(message, content=filtered if filtered.strip() else _SYSTEM_FALLBACK)
+            )
         elif isinstance(content, list):
             blocks = []
             for block in content:
@@ -75,8 +81,12 @@ def filter_system_identity(body: dict) -> dict:
                         blocks.append(dict(block, text=filtered))
                 else:
                     blocks.append(block)
-            if blocks:
-                messages.append(dict(message, content=blocks))
+            messages.append(
+                dict(message, content=blocks if blocks else _SYSTEM_FALLBACK)
+            )
         else:
             messages.append(message)
+    # 兜底：确保首条为 system（否则后端 11128 拒绝）
+    if not messages or not isinstance(messages[0], dict) or messages[0].get("role") not in ("system", "developer"):
+        messages.insert(0, {"role": "system", "content": _SYSTEM_FALLBACK})
     return dict(body, messages=messages)

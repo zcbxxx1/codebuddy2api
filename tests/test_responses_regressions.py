@@ -124,7 +124,7 @@ def test_endpoint_preserves_prompt_schema_and_cache(monkeypatch, stream):
     transport = httpx.MockTransport(upstream)
     monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: real_client(transport=transport, **kw))
     monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
-    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
+    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}, 'backend': lambda self: 'https://copilot.tencent.com'})())
     monkeypatch.setattr(converter, '_log', lambda *a: None)
     monkeypatch.setitem(converter.CONFIG, 'desensitize', True)
     monkeypatch.delenv('CODEBUDDY_LOSSY_PROJECTION', raising=False)

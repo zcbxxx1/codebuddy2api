@@ -69,9 +69,33 @@ from .system_identity import filter_system_identity
 # 常量
 # ---------------------------------------------------------------------------
 
-BACKEND = "https://copilot.tencent.com"
+BACKEND_DEFAULT = "https://copilot.tencent.com"
+# 后端主机按账号所属体系选择：CodeBuddy(www.codebuddy.cn) 与 WorkBuddy(www.workbuddy.ai)
+# 走不同的网关，用错主机会被 APISIX 直接以 401 Authorization Required 拒绝。
+BACKEND_BY_DOMAIN = {
+    "www.codebuddy.cn": "https://copilot.tencent.com",
+    "codebuddy.cn": "https://copilot.tencent.com",
+    "www.workbuddy.ai": "https://www.workbuddy.ai",
+    "workbuddy.ai": "https://www.workbuddy.ai",
+}
+# 兼容旧引用：默认后端（实际请求走 resolve_backend() 按 domain 选择）
+BACKEND = BACKEND_DEFAULT
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy2openai/2.0"
+
+
+def resolve_backend(domain: str | None = None) -> str:
+    """按账号 domain 解析后端主机；可用 CODEBUDDY_BACKEND 环境变量强制覆盖。"""
+    override = os.environ.get("CODEBUDDY_BACKEND")
+    if override:
+        return override.rstrip("/")
+    d = (domain or "").strip().lower()
+    if d in BACKEND_BY_DOMAIN:
+        return BACKEND_BY_DOMAIN[d]
+    if d.endswith("workbuddy.ai"):
+        return "https://www.workbuddy.ai"
+    return BACKEND_DEFAULT
+
 
 # ---------------------------------------------------------------------------
 # 平台相关：定位 auth 目录
@@ -162,7 +186,7 @@ class CredentialManager:
         headers = self._build_headers_from(auth, s.get("account") or {})
         headers["X-Refresh-Token"] = decrypt_auth_field(auth.get("refreshToken", ""))
         headers["X-Auth-Refresh-Source"] = "plugin"
-        url = f"{BACKEND}/v2/plugin/auth/token/refresh"
+        url = f"{self.backend()}/v2/plugin/auth/token/refresh"
         try:
             with httpx.Client(timeout=15) as c:
                 r = c.post(url, headers=headers, json={})
@@ -225,6 +249,11 @@ class CredentialManager:
             s = self._session()
             return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
 
+    def backend(self) -> str:
+        """当前账号对应的后端主机（CodeBuddy / WorkBuddy 走不同网关）。"""
+        s = self._session()
+        return resolve_backend((s.get("auth") or {}).get("domain"))
+
     def summary(self) -> dict:
         s = self._session()
         auth = s.get("auth") or {}
@@ -232,8 +261,11 @@ class CredentialManager:
         exp = auth.get("expiresAt", 0)
         return {
             "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "enterpriseName": acct.get("enterpriseName"),
+            # nickname 在 WorkBuddy 5.6+ 也可能是 $wbEncrypted 信封，需解密后再展示
+            "nickname": decrypt_auth_field(acct.get("nickname") or ""),
+            "enterpriseName": decrypt_auth_field(acct.get("enterpriseName") or "") or None,
+            "domain": auth.get("domain"),
+            "backend": self.backend(),
             "token_expires_at": exp,
             "token_expired": self._is_expired(),
         }
@@ -622,7 +654,7 @@ async def chat_completions(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -1044,7 +1076,7 @@ async def create_response(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
@@ -1223,7 +1255,7 @@ async def create_message(
     )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
@@ -1407,7 +1439,7 @@ async def count_tokens(
         )
 
     headers = cred.get_headers()
-    url = f"{BACKEND}/v2/chat/completions"
+    url = f"{cred.backend()}/v2/chat/completions"
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1483,7 +1515,7 @@ def preflight() -> bool:
     sys.stderr.write("==== 预检 ====\n")
     sys.stderr.write(f"平台      : {sys.platform}\n")
     sys.stderr.write(f"Python    : {sys.version.split()[0]}\n")
-    sys.stderr.write(f"后端      : {BACKEND} (直连，原生 function calling)\n")
+    sys.stderr.write(f"后端      : {BACKEND_DEFAULT} (默认；实际按账号 domain 选择)\n")
     sys.stderr.write(f"登录文件  : {af or '(未找到)'}\n")
     if auth_dirs():
         sys.stderr.write(f"已查目录  : {', '.join(str(d) for d in auth_dirs())}\n")
@@ -1499,6 +1531,12 @@ def preflight() -> bool:
             info = cm.summary()
             sys.stderr.write(
                 f"账号      : {info.get('nickname')} / {info.get('enterpriseName')}\n"
+            )
+            sys.stderr.write(
+                f"域名      : {info.get('domain') or '(无)'}\n"
+            )
+            sys.stderr.write(
+                f"实际后端  : {info.get('backend')} (直连，原生 function calling)\n"
             )
             sys.stderr.write(
                 f"token过期 : {'是(将自动刷新)' if info['token_expired'] else '否'}\n"

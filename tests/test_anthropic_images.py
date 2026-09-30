@@ -58,7 +58,7 @@ def test_endpoints_preserve_image_history(monkeypatch, stream, path):
         return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":50,"completion_tokens":1,"total_tokens":51}}\n\ndata: [DONE]\n\n')
     monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw))
     monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
-    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
+    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}, 'backend': lambda self: 'https://copilot.tencent.com'})())
     monkeypatch.setattr(converter, '_log', lambda *a: None)
     monkeypatch.setitem(converter.CONFIG, 'desensitize', True)
     messages = [{'role': 'user' if i % 2 == 0 else 'assistant', 'content': 'history ' * 200} for i in range(600)] + history()
@@ -74,9 +74,11 @@ def test_endpoints_preserve_image_history(monkeypatch, stream, path):
                 assert 'message_stop' in result.text
     asyncio.run(run())
     result = captured[0]['messages']
-    assert len(result) == 605
-    assert result[600]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
-    assert result[602]['content'][0]['type'] == 'image_url'
-    assert result[602]['tool_call_id'] == 'call1'
-    assert result[603]['tool_call_id'] == 'call2'
-    assert result[604]['role'] == 'user'
+    # 后端要求首条为 system，无 system 时转换器会补一条，故整体 +1
+    assert len(result) == 606
+    assert result[0]['role'] == 'system'
+    assert result[601]['content'][1]['image_url']['url'].startswith('data:image/png;base64,')
+    assert result[603]['content'][0]['type'] == 'image_url'
+    assert result[603]['tool_call_id'] == 'call1'
+    assert result[604]['tool_call_id'] == 'call2'
+    assert result[605]['role'] == 'user'

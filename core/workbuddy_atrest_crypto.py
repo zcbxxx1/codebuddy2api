@@ -51,19 +51,66 @@ except ImportError:  # pragma: no cover
 # 定位 WorkBuddy 可执行文件（用于 run-as-node 调用原生 loggerGet）
 # ---------------------------------------------------------------------------
 
+def _dedup(paths) -> list[Path]:
+    out: list[Path] = []
+    seen: set[str] = set()
+    for p in paths:
+        try:
+            key = str(p).lower()
+        except Exception:  # noqa: BLE001
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_file():
+            out.append(p)
+    return out
+
+
+def _windows_candidates() -> list[Path]:
+    """Windows 官方安装器（WorkBuddyAI）与旧命名（WorkBuddy）的常见位置。"""
+    home = Path.home()
+    local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    progfiles = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
+    ]
+    cands: list[Path] = []
+    for base in progfiles:
+        cands.append(base / "WorkBuddyAI" / "WorkBuddyAI.exe")
+        cands.append(base / "WorkBuddy" / "WorkBuddy.exe")
+    cands.append(local / "Programs" / "WorkBuddyAI" / "WorkBuddyAI.exe")
+    cands.append(local / "Programs" / "WorkBuddy" / "WorkBuddy.exe")
+    found = _dedup(cands)
+    if found:
+        return found
+    # 兜底：在常见安装根目录下按名字扫描一层子目录
+    scanned: list[Path] = []
+    for base in [local / "Programs", *progfiles]:
+        if not base.is_dir():
+            continue
+        try:
+            for sub in base.iterdir():
+                if sub.is_dir() and sub.name.lower().startswith("workbuddy"):
+                    scanned.extend(sub.glob("WorkBuddy*.exe"))
+        except OSError:
+            continue
+    return _dedup(scanned)
+
+
 def _electron_candidates() -> list[Path]:
     env = os.environ.get("WORKBUDDY_ELECTRON_PATH")
-    cands = [Path(env)] if env else []
+    cands: list[Path] = [Path(env)] if env else []
     home = Path.home()
     if sys.platform == "darwin":
         cands.append(Path("/Applications/WorkBuddy.app/Contents/MacOS/Electron"))
+        cands.append(Path("/Applications/WorkBuddyAI.app/Contents/MacOS/WorkBuddyAI"))
     elif sys.platform == "win32":
-        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
-        cands.append(local / "Programs" / "WorkBuddy" / "WorkBuddy.exe")
+        cands.extend(_windows_candidates())
     else:
         cands.append(Path("/opt/WorkBuddy/workbuddy"))
         cands.append(Path("/usr/bin/workbuddy"))
-    return [c for c in cands if c.is_file()]
+    return _dedup(cands)
 
 
 _LOGGERGET_JS = (
@@ -78,7 +125,16 @@ _cached_key: dict | None = None  # {"key": bytes, "keyId": str}
 def _fetch_key_payload() -> dict:
     """通过 WorkBuddy 自带 Electron（run-as-node）调用原生 loggerGet 获取 key payload。"""
     last_err = None
-    for exe in _electron_candidates():
+    exes = _electron_candidates()
+    if not exes:
+        hint = (
+            "未找到 WorkBuddy 可执行文件。请用 WORKBUDDY_ELECTRON_PATH 指定其绝对路径"
+            "（例如 Windows: C:\\\\Program Files\\\\WorkBuddyAI\\\\WorkBuddyAI.exe）。"
+        )
+        if sys.platform == "win32":
+            hint += " 已扫描：%ProgramFiles%\\WorkBuddyAI、%ProgramFiles%\\WorkBuddy、%LOCALAPPDATA%\\Programs。"
+        raise RuntimeError(f"无法获取 WorkBuddy at-rest 密钥（loggerGet）。{hint}")
+    for exe in exes:
         env = dict(os.environ, ELECTRON_RUN_AS_NODE="1")
         try:
             r = subprocess.run(
@@ -92,7 +148,7 @@ def _fetch_key_payload() -> dict:
             last_err = e
     raise RuntimeError(
         "无法获取 WorkBuddy at-rest 密钥（loggerGet）。"
-        f"请确认 WorkBuddy 已安装；也可设置 WORKBUDDY_AT_REST_SECRET "
+        f"已尝试 {len(exes)} 个可执行文件；也可设置 WORKBUDDY_AT_REST_SECRET "
         f"环境变量直接提供 atRestSecretKey（44 字符 base64）。最后错误：{last_err}"
     )
 
@@ -208,15 +264,20 @@ def encrypt_auth_field(plaintext: str) -> dict:
 
 if __name__ == "__main__":
     # 自检：对本机 .info 做解密往返验证（输出脱敏）
-    import glob
-
-    auth_dir = None
+    home = Path.home()
     if sys.platform == "darwin":
-        auth_dir = Path.home() / "Library/Application Support/CodeBuddyExtension/Data/Public/auth"
-    files = sorted(auth_dir.glob("workbuddy-desktop.info")) if auth_dir else []
+        auth_dir = home / "Library/Application Support/CodeBuddyExtension/Data/Public/auth"
+    elif sys.platform == "win32":
+        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+        auth_dir = local / "CodeBuddyExtension/Data/Public/auth"
+    else:
+        xdg = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share"))
+        auth_dir = xdg / "CodeBuddyExtension/Data/Public/auth"
+    files = sorted(auth_dir.glob("*.info")) if auth_dir.is_dir() else []
     if not files:
-        print("未找到 auth 文件，跳过自检")
+        print(f"未找到 auth 文件（{auth_dir}），跳过自检")
         sys.exit(0)
+    print(f"候选可执行文件：{[str(p) for p in _electron_candidates()] or '（无）'}")
     d = json.loads(files[0].read_text())
     tok = d.get("auth", {}).get("accessToken")
     if is_encrypted_field(tok):

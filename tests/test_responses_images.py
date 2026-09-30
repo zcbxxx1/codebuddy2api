@@ -77,7 +77,7 @@ def test_long_image_history_reaches_upstream_as_chat_content(monkeypatch, stream
         return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
     monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(upstream), **kw))
     monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
-    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
+    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}, 'backend': lambda self: 'https://copilot.tencent.com'})())
     monkeypatch.setattr(converter, '_log', lambda *a: None)
     monkeypatch.delenv('CODEBUDDY_LOSSY_PROJECTION', raising=False)
     monkeypatch.delenv('CODEBUDDY_RESPONSES_DESENSITIZE', raising=False)
@@ -92,6 +92,8 @@ def test_long_image_history_reaches_upstream_as_chat_content(monkeypatch, stream
                 final = response.json()
             assert final['output'][0]['content'][0]['text'] == 'ok'
     asyncio.run(run())
-    assert len(captured[0]['messages']) == 605
-    assert captured[0]['messages'][602]['content'][0]['image_url']['url'] == IMAGE
-    assert captured[0]['messages'][0]['content'] == long_history[0]['content']
+    # 后端要求首条为 system，无 system 时转换器会补一条，故整体 +1
+    assert len(captured[0]['messages']) == 606
+    assert captured[0]['messages'][0]['role'] == 'system'
+    assert captured[0]['messages'][603]['content'][0]['image_url']['url'] == IMAGE
+    assert captured[0]['messages'][1]['content'] == long_history[0]['content']

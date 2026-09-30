@@ -43,9 +43,21 @@ def test_brand_mentions_are_not_identity_declarations():
     assert filter_system_text(text) == text
 
 
-def test_identity_only_system_is_removed():
-    assert filter_system_identity({'messages': [{'role': 'system', 'content': 'You are ZCode.'},
-                                               {'role': 'user', 'content': 'hello'}]})['messages'] == [{'role': 'user', 'content': 'hello'}]
+def test_identity_only_system_is_replaced_by_neutral_placeholder():
+    # 后端要求首条必须是 system prompt（否则 11128），
+    # 因此过滤成空后必须保留一条中性 system，而不是整条丢弃。
+    result = filter_system_identity({'messages': [{'role': 'system', 'content': 'You are ZCode.'},
+                                                  {'role': 'user', 'content': 'hello'}]})
+    assert result['messages'][0]['role'] == 'system'
+    assert result['messages'][0]['content'].strip()
+    assert 'ZCode' not in result['messages'][0]['content']
+    assert result['messages'][1] == {'role': 'user', 'content': 'hello'}
+
+
+def test_missing_system_gets_one_prepended():
+    result = filter_system_identity({'messages': [{'role': 'user', 'content': 'hello'}]})
+    assert [m['role'] for m in result['messages']] == ['system', 'user']
+    assert result['messages'][1] == {'role': 'user', 'content': 'hello'}
 
 
 @pytest.mark.parametrize('path', ['/v1/chat/completions', '/v1/responses', '/v1/messages'])
@@ -62,7 +74,7 @@ def test_routes_filter_system_but_preserve_harness_user(monkeypatch, path):
         return httpx.Response(200, content=b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
     monkeypatch.setattr(converter.httpx, 'AsyncClient', lambda **kw: original_client(transport=httpx.MockTransport(upstream), **kw))
     monkeypatch.setattr(converter, '_check_auth', lambda *a: None)
-    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}})())
+    monkeypatch.setattr(converter, '_cred', lambda: type('Credential', (), {'get_headers': lambda self: {}, 'backend': lambda self: 'https://copilot.tencent.com'})())
     monkeypatch.setattr(converter, '_log', lambda *a: None)
     monkeypatch.setitem(converter.CONFIG, 'desensitize', True)
     monkeypatch.setitem(converter.CONFIG, 'no_compact', False)
