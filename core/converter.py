@@ -735,9 +735,12 @@ def _log_finish(model_name: str, t0: float, result: dict, rid: str = ""):
 async def _collect_stream(response: httpx.Response) -> dict:
     """消费后端的 OpenAI SSE 流，聚合成单个非流式 chat.completion 对象。
 
-    合并所有 chunk 的 delta（content / tool_calls），并取 usage / finish_reason。
+    合并所有 chunk 的 delta（reasoning_content / content / tool_calls），
+    并取 usage / finish_reason。reasoning_content 一并保留，
+    与 DeepSeek 官方非流式响应保持一致（否则客户端看不到思考内容）。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     # tool_calls: index -> {id, name, arguments(分片拼接)}
     tool_calls: dict[int, dict] = {}
     model: str | None = None
@@ -764,6 +767,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 content_parts.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning_parts.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
                 slot = tool_calls.setdefault(
@@ -790,6 +795,8 @@ async def _collect_stream(response: httpx.Response) -> dict:
         finish_reason = finish_reason or "tool_calls"
 
     message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tcs:
         message["tool_calls"] = tcs
     return {
@@ -818,6 +825,74 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         }
 
 
+def _is_empty_delta_value(key: str, v) -> bool:
+    """判断 delta 里某个字段是否属于「空值」，空值一律不转发。"""
+    if v is None or v == "":
+        return True
+    if key == "tool_calls" and not v:
+        return True
+    # 废弃的 function_call 字段，后端会用 {"name":"","arguments":""} 占位
+    if key == "function_call" and isinstance(v, dict):
+        return not v.get("name") and not v.get("arguments")
+    return False
+
+
+def _normalize_chunk(obj: dict) -> dict:
+    """把后端非标准 SSE chunk 规整成标准 OpenAI 形状（省略空字段）。
+
+    后端每个分片都固定带上这些字段，哪怕没内容：
+        {"content":"", "reasoning_content":"", "tool_calls":[],
+         "function_call":null, "refusal":"", "extra_fields":null}
+        finish_reason:"" 而非 null，usage:null。
+
+    不少客户端按「字段是否存在」而不是「是否有值」判断类型，于是
+    content 与 reasoning_content 会互相串台，思考被切成大量空块
+    （Cherry Studio 上已复现）。这里直接省略空字段，使流形同标准
+    OpenAI/DeepSeek 服务端输出。
+    """
+    out = dict(obj)
+    choices = out.get("choices")
+    if isinstance(choices, list):
+        new_choices = []
+        for ch in choices:
+            if not isinstance(ch, dict):
+                new_choices.append(ch)
+                continue
+            ch = dict(ch)  # 不修改入参
+            d = ch.get("delta")
+            if isinstance(d, dict):
+                ch["delta"] = {
+                    k: v for k, v in d.items() if not _is_empty_delta_value(k, v)
+                }
+            if ch.get("finish_reason") == "":
+                ch["finish_reason"] = None
+            new_choices.append(ch)
+        out["choices"] = new_choices
+    if out.get("usage") is None:
+        out.pop("usage", None)
+    return out
+
+
+def _normalize_sse_line(line: bytes) -> bytes:
+    """规整单行 SSE；非 data 行 / 无法解析的行原样返回。"""
+    stripped = line.strip()
+    if not stripped.startswith(b"data:"):
+        return line
+    payload = stripped[5:].strip()
+    if not payload or payload == b"[DONE]":
+        return line
+    try:
+        obj = json.loads(payload)
+    except Exception:  # noqa: BLE001
+        return line
+    if not isinstance(obj, dict):
+        return line
+    body = json.dumps(
+        _normalize_chunk(obj), ensure_ascii=False, separators=(",", ":")
+    )
+    return b"data: " + body.encode("utf-8")
+
+
 async def _stream_upstream(
     url: str,
     headers: dict,
@@ -826,8 +901,10 @@ async def _stream_upstream(
     t0: float = 0.0,
     rid: str = "",
 ):
-    """把后端 SSE 原样转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
+    """把后端 SSE 转发给客户端（后端已是标准 OpenAI SSE，含 tool_calls）。
 
+    转发前逐行规整：省略空字段、把 finish_reason 的 "" 归一为 null，
+    避免客户端因空字段串台而切出大量空思考块。
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
     完整原始 SSE 累积后落盘到日志（调试用）。
     """
@@ -887,11 +964,19 @@ async def _stream_upstream(
                     _log(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
                     yield _err_event(err, r.status_code)
                     return
+                pending = b""
                 async for chunk in r.aiter_bytes():
-                    if chunk:
-                        raw_parts.append(chunk)
-                        _feed(chunk)
-                        yield chunk
+                    if not chunk:
+                        continue
+                    raw_parts.append(chunk)
+                    _feed(chunk)
+                    # 按行重组后再转发：TCP 分片可能切断 SSE 行，必须先缓冲成整行
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        yield _normalize_sse_line(line) + b"\n"
+                if pending:
+                    yield _normalize_sse_line(pending)
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {e}")
         yield _err_event(str(e).encode(), 502)
