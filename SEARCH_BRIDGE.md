@@ -49,8 +49,9 @@ DSH 会话（零改动）
    └─ web_search 工具（dsh-tool-web）
         └─ dsh-web-search-deepseek 插件   ← 只改这个插件的 config
              │  POST {baseURL}/messages  （Anthropic Messages + web_search_20250305）
+             │  = POST 127.0.0.1:8787/v1/searchGateway/messages
              ▼
-      本地搜索网关  core/search_gateway.py   (127.0.0.1:8790)
+      converter 主 app 上的搜索路由  core/search_gateway.py
              │  取出真实查询词、剥掉插件前缀
              ▼
       WorkBuddy  core/workbuddy_search.py
@@ -59,6 +60,9 @@ DSH 会话（零改动）
              ▼
         真实搜索结果 ──► 包成 web_search_tool_result + text.citations ──► 返回 DSH
 ```
+
+搜索与对话（`/v1/messages`、`/v1/chat/completions`、`/v1/responses`）共用
+同一个 app 与同一个端口，靠**路径前缀**区分，互不干扰。
 
 ### 关键实现细节
 
@@ -80,39 +84,40 @@ DSH 会话（零改动）
 
 ## 3. 部署步骤
 
-### 3.1 启动（搜索网关默认随代理一起起）
+### 3.1 启动（搜索已并入代理端口，只监听一个端口）
 
-网关已内嵌进 converter，**一个进程同时提供代理和搜索，且默认开启**：
+搜索网关是主 app 上的一个路由，**不需要单独起进程，也不额外占端口**：
 
 ```powershell
 cd O:\SynologyDrive\GitHub\codebuddy2api
 .\.venv\Scripts\python.exe -m core.converter --port 8787
-# → 代理   http://127.0.0.1:8787
-# → 搜索网关 http://127.0.0.1:8790   （默认端口，无需额外参数）
+# → 全部能力都在 8787：
+#    POST /v1/messages                    对话（Anthropic）
+#    POST /v1/chat/completions            对话（OpenAI）
+#    POST /v1/responses                   对话（Responses）
+#    POST /v1/searchGateway/messages      DSH web_search ← 新增
+#    GET  /v1/searchGateway/health        搜索健康检查
 ```
 
-启动输出会明确列出两者：
+启动输出会列出搜索端点：
 
 ```
 ✅ 监听 http://127.0.0.1:8787（直连后端，原生 function calling）
    ...
-   搜索网关  : http://127.0.0.1:8790（供 DSH web-search-deepseek.baseURL 使用）
+   搜索网关  : http://127.0.0.1:8787/v1/searchGateway（供 DSH web-search-deepseek.baseURL 使用）
 ```
 
-**关闭方式**（任一）：
+**关闭**：`--no-search-gateway`（此时 DSH 的 `web_search` 退回官方 DeepSeek 端点）。
 
-| 方式 | 写法 |
-|---|---|
-| 命令行开关 | `--no-search-gateway` |
-| 端口设 0 | `--search-gateway-port 0` |
-| 环境变量 | `CODEBUDDY_SEARCH_GATEWAY_PORT=0` |
+> **为什么路径必须以 `/messages` 结尾**：插件的端点是硬编码的
+> `` `${baseURL}/messages` ``，配置改不了。所以 `baseURL` 要指到
+> `/v1/searchGateway` 这一层，插件才会拼出 `/v1/searchGateway/messages`。
 
-**换端口**：`--search-gateway-port 9100`（记得同步改 `cordis.patch.yml` 的 `baseURL`）。
+> **为什么不用 `/v1` 做前缀**：那样插件会打到 `/v1/messages`，而该路径已被
+> Anthropic 对话端点占用（Claude Code / CC Switch 在用），两者协议形状不同
+> （对话 vs `web_search_20250305`），共用会互相干扰。所以搜索挂在独立前缀下。
 
-绑定地址会自动收敛到回环：若 `--host 0.0.0.0`，网关仍只绑 `127.0.0.1`
-（DSH 插件就在本机，无需对外暴露）。
-
-也可以**单独**起网关进程（只想要搜索、不跑代理）：
+独立调试模式（可选，单独监听一个端口，仅供排障）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m core.search_gateway --port 8790
@@ -121,16 +126,11 @@ cd O:\SynologyDrive\GitHub\codebuddy2api
 健康检查：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8790/health
+Invoke-RestMethod http://127.0.0.1:8787/v1/searchGateway/health
 # {"status":"ok","endpoint":"https://www.workbuddy.ai","auth_file":"...","token_expired":false}
 ```
 
-> **端口占用不会静默遮蔽**。`http.server.HTTPServer` 默认 `allow_reuse_address=1`，
-> 在 Windows 上会让 `bind()` 到已占用端口仍然成功——于是第二个实例"看起来起来了"，
-> 而请求其实被第一个（可能是旧版本的）进程接走。本网关的 `GatewayServer` 显式
-> 关掉了地址复用：端口被占用时**明确报告**并跳过，不会假装成功。
->
-> 网关因任何原因起不来（端口占用、无 WorkBuddy 凭据）都**不影响代理主功能**。
+> 搜索路由挂载失败（或未启用）都**不影响代理主功能**。
 
 ### 3.2 配置 DSH 插件
 
@@ -141,14 +141,15 @@ Invoke-RestMethod http://127.0.0.1:8790/health
   name: "@deepseek-ai/dsh-web-search-deepseek"
   config:
     apiKey: local-bridge          # 占位值，仅用于让插件的 available() 通过
-    baseURL: http://127.0.0.1:8790
+    baseURL: http://127.0.0.1:8787/v1/searchGateway
+    # 插件会拼成 .../v1/searchGateway/messages（后缀 /messages 是插件硬编码的）
 ```
 
 改完重启 DSH（或在支持 HMR 的部分生效后重开）。
 
 ### 3.3 验证
 
-在 DSH 里直接调用 `web_search`，或复刻插件报文验证网关：
+在 DSH 里直接调用 `web_search`，或复刻插件报文验证：
 
 ```powershell
 $body = @{
@@ -157,22 +158,29 @@ $body = @{
       text="Perform a web search for the query: test query" }) })
   tools = @(@{ type="web_search_20250305"; name="web_search"; max_uses=5 })
 } | ConvertTo-Json -Depth 8
-Invoke-RestMethod -Uri http://127.0.0.1:8790/messages -Method POST -Body $body `
-  -ContentType "application/json" | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Uri http://127.0.0.1:8787/v1/searchGateway/messages -Method POST `
+  -Body $body -ContentType "application/json" | ConvertTo-Json -Depth 6
 ```
 
 ---
 
 ## 4. 本机实测结果
 
-网关日志（DSH 会话内直接调用 `web_search`，客户端零改动）：
+搜索日志（DSH 会话内直接调用 `web_search`，客户端零改动，单端口）：
 
 ```
-[search-gateway] 监听 http://127.0.0.1:8790
-[search-gateway] WorkBuddy 端点 : https://www.workbuddy.ai
-[search-gateway] 登录态文件     : C:\Users\13932\AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop-ai.info
-[search-gateway] OK query='Python asyncio best practices 2026' results=8 upstream_ms=7374
-[search-gateway] OK query='Apache Kafka vs RabbitMQ 2026 comparison' results=8 upstream_ms=1938
+[search-gateway] OK query='Redis persistence RDB vs AOF' results=8 upstream_ms=1858 total_ms=2258
+[search-gateway] OK query='FastAPI dependency injection' results=8 upstream_ms=1858 total_ms=2258
+```
+
+同一端口上既有端点未受影响（实测均 200）：
+
+```
+POST /v1/messages            200   对话（Anthropic）
+POST /v1/chat/completions    200   对话（OpenAI）
+GET  /v1/models              200   模型列表
+POST /v1/searchGateway/messages  200   搜索（新增）
+GET  /v1/searchGateway/health    200   搜索健康检查
 ```
 
 搜索可用性对照：
@@ -209,7 +217,9 @@ Invoke-RestMethod -Uri http://127.0.0.1:8790/messages -Method POST -Body $body `
    通用性不如 `/agenttool/v1/search`，故未采用。
 3. **`web_fetch` 未改动**。它本来就能用；若要也走 WorkBuddy 的
    `/agenttool/v1/webfetch`（`{url, prompt}`），可基于 `fetch()` 再包一层。
-4. **网关无鉴权**。仅监听 `127.0.0.1`，不要暴露到公网。
+4. **搜索路由随 app 一起暴露**。若用 `--host 0.0.0.0` 对外提供服务，
+   `/v1/searchGateway/*` 也会一起对外开放且**无独立鉴权**（受主服务的
+   `--api-key` 约束范围与其它端点一致）。仅本机使用时保持默认 `127.0.0.1` 即可。
 5. **不要提交 `apiKey` 到公开仓库**——虽然这里只是占位值。
 
 ---
@@ -219,11 +229,14 @@ Invoke-RestMethod -Uri http://127.0.0.1:8790/messages -Method POST -Body $body `
 ```powershell
 cd O:\SynologyDrive\GitHub\codebuddy2api
 .\.venv\Scripts\python.exe -m pytest tests/test_workbuddy_search.py -q
-# 66 passed
+# 72 passed
 ```
 
 覆盖：查询词前缀剥离、Anthropic 响应形状（含"插件能否还原 snippet"的仿射验证）、
-参数映射、freshness 校验、凭据明文/加密两条路径、网关 HTTP 层
-（200/400/401/404/502、keep-alive 不串包）、`build_server` 工厂，
-converter 内嵌启动（回环绑定、端口占用明确报错、意外不拖垮代理），
-以及**默认开启**与三个关闭开关（用真实 argparse 解析验证）。
+参数映射、freshness 校验、凭据明文/加密两条路径、
+**FastAPI 挂载路径的端到端可达性**（用 TestClient 走完整 ASGI 栈，
+能抓到"`Request` 注解解析失败被当成 query 参数 → 422"这类只在请求期暴露的问题）、
+公共核心 `handle_search_request` 的错误码映射（400/401/502）、
+独立调试模式的 HTTP 层（200/400/401/404/502、keep-alive 不串包、
+`allow_reuse_address` 关闭、端口冲突明确报错），
+以及**默认挂载**与 `--no-search-gateway` 关闭开关（用真实 argparse 解析验证）。

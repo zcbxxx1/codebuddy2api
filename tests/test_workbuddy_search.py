@@ -503,103 +503,121 @@ class TestBuildServer:
 
 
 class TestConverterIntegration:
-    """converter 的搜索网关内嵌启动。"""
+    """converter 把搜索网关挂到主 app 上（单端口）。"""
 
-    def test_start_search_gateway_binds_and_runs(self):
+    def test_mount_returns_prefix(self):
         from core import converter
+
+        assert converter.mount_search_gateway(enabled=True) == "/v1/searchGateway"
+
+    def test_mount_disabled_returns_none(self):
+        from core import converter
+
+        assert converter.mount_search_gateway(enabled=False) is None
+
+    def test_mounted_routes_respond(self):
+        """挂载后 /v1/searchGateway/{health,messages} 都必须真实可达。
+
+        这里用 TestClient 走完整 ASGI 栈：能抓到诸如
+        'Request 被当成 query 参数'（注解解析失败）这类只在请求期暴露的问题。
+        """
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from core.search_gateway import make_search_router
+
+        test_app = FastAPI()
+        test_app.include_router(make_search_router())
 
         with patch("core.search_gateway.load_session", return_value=WorkBuddySession(access_token="t")):
-            with patch("sys.stderr") as err:
-                converter._start_search_gateway(0, "127.0.0.1")
-                printed = "".join(str(c) for c in err.write.call_args_list)
-        assert "搜索网关" in printed
+            with TestClient(test_app) as client:
+                # health 走真实 load_session（已 patch）
+                assert client.get("/v1/searchGateway/health").status_code == 200
 
-    def test_wildcard_host_binds_loopback_only(self):
-        """--host 0.0.0.0 时网关仍只绑回环，避免把搜索能力暴露到局域网。"""
-        from core import converter
+                # 无工具声明 → 400（而不是 422：那说明 request 注解没解析对）
+                r = client.post("/v1/searchGateway/messages", json={"messages": []})
+                assert r.status_code == 400, r.text
 
-        captured = {}
+                # 真实搜索（mock 掉上游）
+                outcome = SearchOutcome(
+                    query="q",
+                    results=[{"url": "https://x.test", "title": "X", "snippet": "s"}],
+                )
+                with patch("core.search_gateway.search", return_value=outcome):
+                    r = client.post(
+                        "/v1/searchGateway/messages",
+                        json={
+                            "model": "deepseek-v4-flash",
+                            "messages": [{"role": "user", "content": [
+                                {"type": "text", "text": "Perform a web search for the query: q"}]}],
+                            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                        },
+                    )
+                assert r.status_code == 200, r.text
+                body = r.json()
+                assert any(b["type"] == "web_search_tool_result" for b in body["content"])
 
-        def fake_build(host, port, **kw):
-            captured["host"] = host
-            raise RuntimeError("stop here")
+    def test_route_does_not_shadow_existing_endpoints(self):
+        """搜索路径不能占用既有对话端点（必须挂在独立前缀下）。"""
+        from core.search_gateway import SEARCH_ROUTE_PREFIX
 
-        with patch("core.search_gateway.build_server", side_effect=fake_build):
-            with patch("sys.stderr"):
-                converter._start_search_gateway(8790, "0.0.0.0")
-        assert captured["host"] == "127.0.0.1"
+        assert SEARCH_ROUTE_PREFIX == "/v1/searchGateway"
+        # 关键：不能是 /v1 本身，否则 /v1/messages 会被插件与对话共用
+        assert SEARCH_ROUTE_PREFIX != "/v1"
+        assert SEARCH_ROUTE_PREFIX.startswith("/v1/")
 
-    def test_oserror_reports_port_conflict_not_silent(self):
-        """端口占用必须明说，不能静默假装成功（否则请求会被旧进程接走）。"""
-        from core import converter
+    def test_plugin_endpoint_derivation(self):
+        """插件用 `${baseURL}/messages` 拼端点，验证我们给的 baseURL 能拼对。"""
+        from core.search_gateway import SEARCH_ROUTE_PREFIX
 
-        with patch("core.search_gateway.build_server", side_effect=OSError(10048, "address in use")):
-            with patch("sys.stderr") as err:
-                converter._start_search_gateway(8790, "127.0.0.1")  # 不应抛
-                printed = "".join(str(c) for c in err.write.call_args_list)
-        assert "已被占用" in printed
-        assert "8790" in printed
-
-    def test_unexpected_failure_is_swallowed(self):
-        """其他意外也不能拖垮代理启动。"""
-        from core import converter
-
-        with patch("core.search_gateway.build_server", side_effect=RuntimeError("boom")):
-            with patch("sys.stderr") as err:
-                converter._start_search_gateway(8790, "127.0.0.1")  # 不应抛
-                printed = "".join(str(c) for c in err.write.call_args_list)
-        assert "已跳过" in printed
+        assert SEARCH_ROUTE_PREFIX + "/messages" == "/v1/searchGateway/messages"
 
 
 class TestDefaultOnStartup:
-    """搜索网关默认随代理启动。"""
+    """搜索网关默认挂载（单端口）。"""
 
-    def test_default_port_constant(self):
-        from core.converter import DEFAULT_SEARCH_GATEWAY_PORT
-
-        assert DEFAULT_SEARCH_GATEWAY_PORT == 8790
-
-    def _parse(self, argv):
-        """用真实 parser 解析，验证默认值与关闭开关。
-
-        converter.main() 直接读 sys.argv（不接受参数），所以这里 patch sys.argv。
-        """
+    def _run_main(self, argv):
+        """用真实 parser 跑 converter.main()，返回 mount 的调用记录。"""
         from core import converter
 
         with patch.object(converter.uvicorn, "run"), patch.object(
             converter, "preflight"
         ), patch.object(converter, "find_auth_file", return_value=None), patch.object(
-            converter, "_start_search_gateway"
-        ) as starter, patch.object(
+            converter, "mount_search_gateway"
+        ) as mounter, patch.object(
             converter, "_log"
         ), patch("sys.stderr"), patch.object(
             sys, "argv", ["converter", *argv]
         ):
             converter.main()
-        return starter
+        return mounter
 
     def test_enabled_by_default(self):
-        """不传任何搜索相关参数时，也应自动拉起网关。"""
-        starter = self._parse(["--skip-check"])
-        assert starter.called
-        assert starter.call_args[0][0] == 8790
+        """不传任何搜索相关参数时，也应挂载搜索网关。"""
+        mounter = self._run_main(["--skip-check"])
+        assert mounter.called
+        assert mounter.call_args.kwargs.get("enabled") is True
 
     def test_no_search_gateway_flag_disables(self):
-        starter = self._parse(["--skip-check", "--no-search-gateway"])
-        assert not starter.called
+        mounter = self._run_main(["--skip-check", "--no-search-gateway"])
+        assert mounter.called
+        assert mounter.call_args.kwargs.get("enabled") is False
 
-    def test_port_zero_disables(self):
-        starter = self._parse(["--skip-check", "--search-gateway-port", "0"])
-        assert not starter.called
+    def test_removed_port_flag_no_longer_accepted(self):
+        """旧的独立端口参数已移除（搜索现在复用主端口）。"""
+        from core import converter
 
-    def test_explicit_port_respected(self):
-        starter = self._parse(["--skip-check", "--search-gateway-port", "9100"])
-        assert starter.called
-        assert starter.call_args[0][0] == 9100
+        with patch.object(converter, "uvicorn"), patch.object(converter, "preflight"), patch.object(
+            converter, "find_auth_file", return_value=None
+        ), patch.object(converter, "_log"), patch("sys.stderr"), patch.object(
+            sys, "argv", ["converter", "--skip-check", "--search-gateway-port", "9100"]
+        ):
+            with pytest.raises(SystemExit):
+                converter.main()
 
 
-class TestPortConflictNotSilentlyShared:
-    """GatewayServer 必须禁用地址复用。"""
+class TestStandaloneServerStillWorks:
+    """独立调试模式保留（build_server + GatewayServer）。"""
 
     def test_allow_reuse_address_disabled(self):
         """http.server 默认 allow_reuse_address=1，Windows 上会让 bind 到已占用端口
@@ -620,3 +638,80 @@ class TestPortConflictNotSilentlyShared:
                     gw.build_server("127.0.0.1", port)
         finally:
             first.server_close()
+
+    def test_standalone_serves_same_core(self, gateway):
+        """独立模式的 HTTP 行为与 FastAPI 挂载共用同一核心。"""
+        with patch("core.search_gateway.search") as searcher:
+            searcher.return_value = SearchOutcome(
+                query="q", results=[{"url": "https://x.test", "title": "X", "snippet": "s"}]
+            )
+            status, resp = _post(f"{gateway}/messages", PLUGIN_BODY)
+        assert status == 200
+        assert any(b["type"] == "web_search_tool_result" for b in resp["content"])
+
+
+class TestSharedCoreParity:
+    """handle_search_request 是两条传输路径的公共核心。"""
+
+    def _body(self):
+        return {
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Perform a web search for the query: q"}]}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        }
+
+    def test_rejects_missing_tool(self):
+        from core.search_gateway import SearchRequestError, handle_search_request
+
+        with pytest.raises(SearchRequestError) as ei:
+            handle_search_request({"messages": []})
+        assert ei.value.status == 400
+
+    def test_rejects_empty_query(self):
+        from core.search_gateway import SearchRequestError, handle_search_request
+
+        with pytest.raises(SearchRequestError):
+            handle_search_request(
+                {"messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Perform a web search for the query: "}]}],
+                 "tools": [{"type": "web_search_20250305"}]}
+            )
+
+    def test_maps_auth_error_to_401(self):
+        from core.search_gateway import SearchRequestError, handle_search_request
+
+        with patch("core.search_gateway.search", side_effect=SearchError("HTTP 401 拒绝")):
+            with pytest.raises(SearchRequestError) as ei:
+                handle_search_request(self._body())
+        assert ei.value.status == 401
+        assert ei.value.err_type == "authentication_error"
+
+    def test_maps_other_error_to_502(self):
+        from core.search_gateway import SearchRequestError, handle_search_request
+
+        with patch("core.search_gateway.search", side_effect=SearchError("网络不可达")):
+            with pytest.raises(SearchRequestError) as ei:
+                handle_search_request(self._body())
+        assert ei.value.status == 502
+
+    def test_success_shape(self):
+        from core.search_gateway import handle_search_request
+
+        outcome = SearchOutcome(
+            query="q", results=[{"url": "https://x.test", "title": "X", "snippet": "s"}]
+        )
+        with patch("core.search_gateway.search", return_value=outcome):
+            payload = handle_search_request(self._body())
+        assert payload["role"] == "assistant"
+        assert any(b["type"] == "web_search_tool_result" for b in payload["content"])
+
+    def test_has_web_search_tool_variants(self):
+        from core.search_gateway import has_web_search_tool
+
+        assert has_web_search_tool({"tools": [{"type": "web_search_20250305"}]})
+        assert has_web_search_tool({"tools": [{"name": "web_search"}]})
+        assert has_web_search_tool({"tools": [{"type": "web_search_preview"}]})
+        assert not has_web_search_tool({"tools": [{"type": "function", "name": "grep"}]})
+        assert not has_web_search_tool({})
+

@@ -14,15 +14,21 @@ search_gateway — 把 DSH 的 web_search 桥接到本机 WorkBuddy 登录态的
   `web-search-deepseek` 配置 baseURL 指向本网关，并给一个占位 apiKey
   让插件的 available() 判定为真。
 
-用法：
-    python -m core.search_gateway --port 8790
+用法（正常路径——搜索已并入代理端口，无需单独起进程）：
+    python -m core.converter --port 8787
+    # 搜索端点即 POST http://127.0.0.1:8787/v1/searchGateway/messages
 
 然后在 ~/.dsh/profiles/desktop/cordis.patch.yml 中：
     - id: web-search-deepseek
       name: "@deepseek-ai/dsh-web-search-deepseek"
       config:
         apiKey: local-bridge          # 占位值，仅用于让 available() 通过
-        baseURL: http://127.0.0.1:8790
+        baseURL: http://127.0.0.1:8787/v1/searchGateway
+        # 插件会拼成 .../v1/searchGateway/messages（后缀 /messages 是插件硬编码的）
+
+独立调试模式（可选，单独监听一个端口）：
+    python -m core.search_gateway --port 8790
+    # 此时端点即 POST http://127.0.0.1:8790/messages
 """
 
 from __future__ import annotations
@@ -34,6 +40,11 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+# FastAPI 相关必须在模块顶层导入：见 make_search_router 的注释
+# （本模块启用了 `from __future__ import annotations`，注解按模块全局解析）。
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 
 try:
     from .workbuddy_search import (
@@ -58,7 +69,6 @@ except ImportError:  # pragma: no cover - 支持脚本直跑
 
 def _setup_console_encoding() -> None:
     """把 stdout/stderr 切成 UTF-8，避免 Windows GBK 控制台下中文日志乱码。
-
     Python 的 TextIOWrapper 是**惰性编码**的：编码错误要到 flush/write 落盘时才暴露，
     所以不能靠 try/except 在写日志时兜住——必须在启动时就把编码定好。
     """
@@ -86,6 +96,86 @@ def _log(msg: str) -> None:
             sys.stderr.flush()
         except Exception:  # noqa: BLE001
             pass
+
+
+class SearchRequestError(Exception):
+    """请求本身不合法（缺工具声明、无查询词、JSON 坏）→ HTTP 400。"""
+
+    def __init__(self, message: str, status: int = 400, err_type: str = "invalid_request_error"):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.err_type = err_type
+
+
+def has_web_search_tool(body: dict) -> bool:
+    """请求里是否声明了 web_search（托管型或 function 型皆认）。"""
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        ttype = str(tool.get("type") or "")
+        if ttype.startswith("web_search") or tool.get("name") == "web_search":
+            return True
+    return False
+
+
+def handle_search_request(
+    body: dict, *, max_results: int = DEFAULT_MAX_RESULTS
+) -> dict:
+    """搜索桥的**传输无关**核心：Anthropic Messages 请求体 → 响应体。
+
+    不依赖 HTTP 框架，供 FastAPI 路由与（测试用的）独立 HTTP server 共用。
+    失败时抛 SearchRequestError（携带应回的 HTTP 状态码）。
+    """
+    if not isinstance(body, dict):
+        raise SearchRequestError("请求体必须是 JSON 对象")
+
+    if not has_web_search_tool(body):
+        # 没有 web_search 工具：调用方没走搜索语义（可能误把这个路径当对话端点）。
+        raise SearchRequestError(
+            "请求缺少 web_search 工具声明；该端点只服务 DSH 的 web_search，"
+            "不转发普通对话（对话请用 /v1/messages 或 /v1/responses）。"
+        )
+
+    query = build_search_query(body.get("messages") or [])
+    if not query:
+        raise SearchRequestError("无法从请求中解析出搜索词")
+
+    started = time.time()
+    try:
+        outcome = search(query, max_results=max_results)
+    except SearchError as e:
+        _log(f"搜索失败 query={query!r}: {e}")
+        # 401 类鉴权问题按 authentication_error 返回，便于排查
+        status = 401 if "401" in str(e) else 502
+        raise SearchRequestError(
+            str(e), status, "authentication_error" if status == 401 else "api_error"
+        ) from e
+    except Exception as e:  # noqa: BLE001
+        _log(f"搜索异常 query={query!r}: {e!r}")
+        raise SearchRequestError(f"搜索桥接内部错误：{e}", 502, "api_error") from e
+
+    model = str(body.get("model") or "deepseek-v4-flash")
+    payload = to_anthropic_messages_response(outcome, model=model)
+    _log(
+        f"OK query={query!r} results={len(outcome.results)} "
+        f"upstream_ms={outcome.elapsed_ms} total_ms={int((time.time() - started) * 1000)}"
+    )
+    return payload
+
+
+def health_payload() -> tuple[int, dict]:
+    """健康检查的（状态码, 响应体）。"""
+    try:
+        sess = load_session()
+        return 200, {
+            "status": "ok",
+            "endpoint": sess.endpoint,
+            "auth_file": str(sess.path) if sess.path else None,
+            "token_expired": sess.expired,
+        }
+    except SearchError as e:
+        return 503, {"status": "error", "message": str(e)}
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -138,32 +228,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 pass
 
     def _has_web_search_tool(self, body: dict) -> bool:
-        for tool in body.get("tools") or []:
-            if not isinstance(tool, dict):
-                continue
-            ttype = str(tool.get("type") or "")
-            if ttype.startswith("web_search") or tool.get("name") == "web_search":
-                return True
-        return False
+        return has_web_search_tool(body)
 
     # ---- 路由 ----
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path in ("/health", "/healthz"):
-            try:
-                sess = load_session()
-                self._send(
-                    200,
-                    {
-                        "status": "ok",
-                        "endpoint": sess.endpoint,
-                        "auth_file": str(sess.path) if sess.path else None,
-                        "token_expired": sess.expired,
-                    },
-                )
-            except SearchError as e:
-                self._send(503, {"status": "error", "message": str(e)})
+            status, payload = health_payload()
+            self._send(status, payload)
             return
         self._send(404, {"error": "not found"})
 
@@ -181,46 +254,68 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._error(400, str(e))
             return
 
-        if not self._has_web_search_tool(body):
-            # 没有 web_search 工具：说明调用方没走搜索语义（例如被误当聊天端点）。
-            self._error(
-                400,
-                "请求缺少 web_search 工具声明；本网关只服务 DSH 的 web_search 能力，"
-                "不转发普通对话（对话请用 /v1/responses 或 /v1/chat/completions）。",
-            )
-            return
-
-        query = build_search_query(body.get("messages") or [])
-        if not query:
-            self._error(400, "无法从请求中解析出搜索词")
-            return
-
-        max_results = int(
-            self.server.max_results  # type: ignore[attr-defined]
-            or DEFAULT_MAX_RESULTS
-        )
-
-        started = time.time()
         try:
-            outcome = search(query, max_results=max_results)
-        except SearchError as e:
-            _log(f"搜索失败 query={query!r}: {e}")
-            # 401 类鉴权问题按 authentication_error 返回，便于排查
-            status = 401 if "401" in str(e) else 502
-            self._error(status, str(e), "authentication_error" if status == 401 else "api_error")
-            return
-        except Exception as e:  # noqa: BLE001
-            _log(f"搜索异常 query={query!r}: {e!r}")
-            self._error(502, f"搜索桥接内部错误：{e}", "api_error")
+            payload = handle_search_request(
+                body,
+                max_results=int(
+                    self.server.max_results  # type: ignore[attr-defined]
+                    or DEFAULT_MAX_RESULTS
+                ),
+            )
+        except SearchRequestError as e:
+            self._error(e.status, e.message, e.err_type)
             return
 
-        model = str(body.get("model") or "deepseek-v4-flash")
-        payload = to_anthropic_messages_response(outcome, model=model)
-        _log(
-            f"OK query={query!r} results={len(outcome.results)} "
-            f"upstream_ms={outcome.elapsed_ms} total_ms={int((time.time()-started)*1000)}"
-        )
         self._send(200, payload)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI 挂载（把搜索并入主代理端口，不再单独监听）
+# ---------------------------------------------------------------------------
+
+# 默认挂载路径。必须以 /messages 结尾——插件的 endpoint 是
+# `${baseURL}/messages` 硬编码的，所以 baseURL 要指到这一层的上一层。
+SEARCH_ROUTE_PREFIX = "/v1/searchGateway"
+
+
+def make_search_router(*, max_results: int = DEFAULT_MAX_RESULTS):
+    """构造搜索能力的 FastAPI APIRouter，供 converter 挂到主 app 上。
+
+    路径：POST {prefix}/messages 与 GET {prefix}/health
+    挂上后 cordis.patch.yml 里 baseURL 写 `http://127.0.0.1:8787/v1/searchGateway`。
+    """
+    # 注意：本模块有 `from __future__ import annotations`，函数注解会变成字符串，
+    # FastAPI 需要按**模块全局**解析它们。所以 Request 必须在模块顶层导入
+    # （放在这里当局部名会解析失败，被误当成 query 参数 → 422）。
+    router = APIRouter()
+
+    @router.get(SEARCH_ROUTE_PREFIX + "/health")
+    def search_health():
+        status, payload = health_payload()
+        return JSONResponse(status_code=status, content=payload)
+
+    @router.post(SEARCH_ROUTE_PREFIX + "/messages")
+    async def search_messages(request: Request):
+        try:
+            body = await request.json()
+        except Exception as e:  # noqa: BLE001 - 非法 JSON
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": f"请求体不是合法 JSON：{e}"},
+                },
+            )
+        try:
+            payload = handle_search_request(body, max_results=max_results)
+        except SearchRequestError as e:
+            return JSONResponse(
+                status_code=e.status,
+                content={"type": "error", "error": {"type": e.err_type, "message": e.message}},
+            )
+        return JSONResponse(status_code=200, content=payload)
+
+    return router
 
 
 class GatewayServer(ThreadingHTTPServer):
@@ -292,7 +387,11 @@ def main(argv: list[str] | None = None) -> int:
     _log(f"WorkBuddy 端点 : {sess.endpoint}")
     _log(f"登录态文件     : {sess.path}")
     _log(f"token 过期     : {sess.expired}")
-    _log("接入方式       : cordis.patch.yml → web-search-deepseek.baseURL 指向本地址")
+    _log(
+        "接入方式       : cordis.patch.yml → web-search-deepseek.baseURL "
+        f"指向 http://{args.host}:{args.port}"
+    )
+    _log("注意           : 该独立模式仅供调试；正常使用请直接用 converter（搜索已并入其端口）")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

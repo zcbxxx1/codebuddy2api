@@ -232,12 +232,11 @@ python3 -m core.converter --api-key mysecret
 python3 -m core.converter --port 9000
 ```
 
-启动后会同时监听两个端口：
+启动后所有能力都在同一个端口上：
 
-- **代理** `--port`（默认 8787）：模型协议转换。
-- **搜索网关** `--search-gateway-port`（默认 **8790**，随主服务自动启动）：
-  把 DSH 的 `web_search` 桥接到本机 WorkBuddy 登录态。不需要可关：
-  `--no-search-gateway` 或 `--search-gateway-port 0`。
+- **对话**：`/v1/chat/completions`、`/v1/responses`、`/v1/messages`
+- **搜索网关**：`/v1/searchGateway/messages`（默认挂载，把 DSH 的 `web_search`
+  桥接到本机 WorkBuddy 登录态；不需要可加 `--no-search-gateway`）
 
 详见 [SEARCH_BRIDGE.md](SEARCH_BRIDGE.md)。
 
@@ -253,8 +252,7 @@ python3 -m core.converter --port 9000
 | `--no-compact` | 关 | 配合 `--desensitize` 使用，保留更完整的原始 system prompt |
 | `--system-prompt` | 无 | 自定义首条 system 提示词（`@文件` 可读文件） |
 | `--system-prompt-mode` | `fallback` | `fallback` / `prepend` / `replace` |
-| `--search-gateway-port` | `8790` | 搜索网关端口；`0` 表示不启动 |
-| `--no-search-gateway` | 关 | 不启动搜索网关（等价于端口设 `0`） |
+| `--no-search-gateway` | 关 | 不挂载搜索网关（DSH 搜索退回官方端点） |
 | `--skip-check` | 否 | 跳过启动预检 |
 
 ### curl 示例

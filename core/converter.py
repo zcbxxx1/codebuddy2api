@@ -83,10 +83,6 @@ BACKEND = BACKEND_DEFAULT
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy2openai/2.0"
 
-# 搜索网关默认端口，随代理一起启动（把 DSH 的 web_search 桥接到 WorkBuddy 登录态）。
-# 设成 0 或传 --no-search-gateway 可关闭；起不来不影响代理主功能。
-DEFAULT_SEARCH_GATEWAY_PORT = 8790
-
 
 def resolve_backend(domain: str | None = None) -> str:
     """按账号 domain 解析后端主机；可用 CODEBUDDY_BACKEND 环境变量强制覆盖。"""
@@ -1714,25 +1710,11 @@ def main():
     )
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument(
-        "--search-gateway-port",
-        type=int,
-        default=int(
-            os.environ.get("CODEBUDDY_SEARCH_GATEWAY_PORT") or DEFAULT_SEARCH_GATEWAY_PORT
-        ),
-        metavar="PORT",
-        help=f"同时在本机拉起搜索网关，把 DSH 的 web_search 桥接到 WorkBuddy 登录态"
-        f"（默认 {DEFAULT_SEARCH_GATEWAY_PORT}）。设 CODEBUDDY_SEARCH_GATEWAY_PORT=0 "
-        f"或传 --search-gateway-port 0 可关闭。",
-    )
-    ap.add_argument(
         "--no-search-gateway",
         action="store_true",
-        help="不启动搜索网关（等价于 --search-gateway-port 0）。",
+        help="不挂载搜索网关；DSH 的 web_search 将退回官方 DeepSeek 端点。",
     )
     args = ap.parse_args()
-
-    if args.no_search_gateway:
-        args.search_gateway_port = 0
 
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
@@ -1745,6 +1727,9 @@ def main():
     )
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
+
+    # 把搜索网关挂到主 app 上（复用主端口，不额外监听）
+    search_route = mount_search_gateway(enabled=not args.no_search_gateway)
 
     if not args.skip_check:
         preflight()
@@ -1774,60 +1759,48 @@ def main():
     if args.desensitize:
         mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
         sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
+    if search_route:
+        sys.stderr.write(
+            f"   搜索网关  : http://127.0.0.1:{args.port}{search_route}"
+            "（供 DSH web-search-deepseek.baseURL 使用）\n"
+        )
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
 
     # 启动时写一条标记
     _log("==== converter 启动 ====")
 
-    if args.search_gateway_port:
-        _start_search_gateway(args.search_gateway_port, args.host)
-
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
-def _start_search_gateway(port: int, host: str) -> None:
-    """在同进程内以守护线程拉起搜索网关（失败不影响代理主功能）。
+def mount_search_gateway(*, enabled: bool = True) -> str | None:
+    """把搜索网关挂到主 FastAPI app 上（复用主端口，不额外监听）。
 
-    DSH 的 web_search 由宿主侧插件执行、另发一个 Anthropic Messages 请求，
-    不经过本代理的模型链路；这里顺带把那个端点也提供出来，省得单独起进程。
+    DSH 的 web_search 由宿主侧插件执行、另发一个 Anthropic Messages 请求
+    （endpoint 是 `${baseURL}/messages`），不经过本代理的模型链路。
+    这里在主 app 上提供该路径，让 DSH 只连一个端口。
+
+    返回挂载的路径前缀（未启用/失败时返回 None）。挂载失败不影响代理主功能。
     """
+    if not enabled:
+        return None
     try:
-        from .search_gateway import SearchError, build_server
+        from .search_gateway import SEARCH_ROUTE_PREFIX, make_search_router
     except ImportError:  # pragma: no cover - 脚本直跑时
         try:
-            from search_gateway import SearchError, build_server  # type: ignore[no-redef]
+            from search_gateway import (  # type: ignore[no-redef]
+                SEARCH_ROUTE_PREFIX,
+                make_search_router,
+            )
         except ImportError as e:
             sys.stderr.write(f"   搜索网关  : 无法导入模块（{e}），已跳过\n")
-            return
+            return None
 
-    # 绑定地址用本机回环：DSH 插件就在本机，无需对外暴露
-    bind = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     try:
-        httpd = build_server(bind, port)
-    except OSError as e:
-        # 端口占用：说明已有实例在跑（或别的程序占了）。不要静默假装成功，
-        # 否则 DSH 的搜索会被那个旧进程接走，排查起来极难。
-        sys.stderr.write(
-            f"   搜索网关  : 端口 {port} 已被占用（{e.strerror or e}），未启动。\n"
-            f"               若已有实例在跑可忽略；否则换端口："
-            f"--search-gateway-port <PORT>，并同步改 cordis.patch.yml 的 baseURL。\n"
-        )
-        return
-    except SearchError as e:
-        sys.stderr.write(f"   搜索网关  : 未启动（{e}）\n")
-        return
-    except Exception as e:  # noqa: BLE001 - 任何意外都不该拖垮代理
-        sys.stderr.write(f"   搜索网关  : 启动失败（{e}），已跳过\n")
-        return
-
-    t = threading.Thread(
-        target=httpd.serve_forever, name="search-gateway", daemon=True
-    )
-    t.start()
-    sys.stderr.write(
-        f"   搜索网关  : http://{bind}:{port}"
-        "（供 DSH web-search-deepseek.baseURL 使用）\n"
-    )
+        app.include_router(make_search_router())
+    except Exception as e:  # noqa: BLE001 - 挂载失败不该拖垮代理
+        sys.stderr.write(f"   搜索网关  : 挂载失败（{e}），已跳过\n")
+        return None
+    return SEARCH_ROUTE_PREFIX
 
 
 if __name__ == "__main__":
