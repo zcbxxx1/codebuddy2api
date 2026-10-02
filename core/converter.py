@@ -63,7 +63,7 @@ from .responses_adapter import (
     responses_request_to_chat,
 )
 from .responses_projection import project_responses_chat_body
-from .system_identity import filter_system_identity
+from .system_identity import apply_system_prompt, filter_system_identity
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -82,6 +82,10 @@ BACKEND_BY_DOMAIN = {
 BACKEND = BACKEND_DEFAULT
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 USER_AGENT = "codebuddy2openai/2.0"
+
+# 搜索网关默认端口，随代理一起启动（把 DSH 的 web_search 桥接到 WorkBuddy 登录态）。
+# 设成 0 或传 --no-search-gateway 可关闭；起不来不影响代理主功能。
+DEFAULT_SEARCH_GATEWAY_PORT = 8790
 
 
 def resolve_backend(domain: str | None = None) -> str:
@@ -472,6 +476,9 @@ CONFIG: dict = {
     "log_path": None,
     "desensitize": False,
     "no_compact": False,
+    # 自定义首条系统提示词（空串表示不干预，沿用客户端发来的 system）
+    "system_prompt": "",
+    "system_prompt_mode": "fallback",  # fallback | prepend | replace
 }  # cred: CredentialManager | None
 
 
@@ -537,6 +544,33 @@ def _cred() -> CredentialManager:
             },
         )
     return CONFIG["cred"]
+
+
+def _load_system_prompt(value: str) -> str:
+    """支持 --system-prompt "@prompt.txt" 从文件读取（便于放长提示词）。"""
+    if not value:
+        return ""
+    if value.startswith("@"):
+        path = Path(value[1:]).expanduser()
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise SystemExit(f"无法读取 system prompt 文件 {path}：{e}") from None
+    return value
+
+
+def _prepare_system(body: dict) -> dict:
+    """统一的 system 消息处理入口。
+
+    配置了 system_prompt 时按 system_prompt_mode 应用；
+    未配置时只做客户端身份过滤（保持原行为）。
+    """
+    prompt = CONFIG.get("system_prompt") or ""
+    if prompt:
+        return apply_system_prompt(
+            body, prompt, CONFIG.get("system_prompt_mode") or "fallback"
+        )
+    return filter_system_identity(body)
 
 
 @app.get("/health")
@@ -620,7 +654,7 @@ async def chat_completions(
             for m in body["messages"]
         ]
 
-    body = filter_system_identity(body)
+    body = _prepare_system(body)
 
     # 可选：脱敏。缓解客户端合规模板（如 Codex CLI / ZCode 注入的说明文字）被后端误判为敏感词。
     # 处理 system / developer 消息、Codex 注入的上下文 user 消息，以及 tools 的 description。
@@ -1127,7 +1161,7 @@ async def create_response(
             },
         )
 
-    chat_body = filter_system_identity(chat_body)
+    chat_body = _prepare_system(chat_body)
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, preserve=os.environ.get("CODEBUDDY_LOSSY_PROJECTION", "0") != "1"
     )
@@ -1318,7 +1352,7 @@ async def create_message(
     if "stream_options" not in chat_body:
         chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = filter_system_identity(chat_body)
+    chat_body = _prepare_system(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
@@ -1512,7 +1546,7 @@ async def count_tokens(
     chat_body["stream"] = True  # 后端只支持流式
     chat_body["stream_options"] = {"include_usage": True}
 
-    chat_body = filter_system_identity(chat_body)
+    chat_body = _prepare_system(chat_body)
     if CONFIG.get("desensitize"):
         chat_body = desensitize_body(
             chat_body,
@@ -1664,12 +1698,47 @@ def main():
         "保留原始 system prompt 完整内容（如 Claude Code 的行为指令），"
         "但审核误拦风险略高于默认压缩模式。",
     )
+    ap.add_argument(
+        "--system-prompt",
+        default=os.environ.get("CODEBUDDY_SYSTEM_PROMPT", ""),
+        metavar="TEXT",
+        help="自定义首条 system 提示词。不传则沿用客户端发来的 system。"
+        "也可用 CODEBUDDY_SYSTEM_PROMPT 环境变量（TEXT 传 @文件路径 可读文件）。",
+    )
+    ap.add_argument(
+        "--system-prompt-mode",
+        default=os.environ.get("CODEBUDDY_SYSTEM_PROMPT_MODE", "fallback"),
+        choices=("fallback", "prepend", "replace"),
+        help="自定义提示词的应用方式：fallback=仅客户端没发/被过滤空时使用（默认）；"
+        "prepend=插到最前并保留客户端 system；replace=丢弃客户端 system 只用自定义的。",
+    )
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
+    ap.add_argument(
+        "--search-gateway-port",
+        type=int,
+        default=int(
+            os.environ.get("CODEBUDDY_SEARCH_GATEWAY_PORT") or DEFAULT_SEARCH_GATEWAY_PORT
+        ),
+        metavar="PORT",
+        help=f"同时在本机拉起搜索网关，把 DSH 的 web_search 桥接到 WorkBuddy 登录态"
+        f"（默认 {DEFAULT_SEARCH_GATEWAY_PORT}）。设 CODEBUDDY_SEARCH_GATEWAY_PORT=0 "
+        f"或传 --search-gateway-port 0 可关闭。",
+    )
+    ap.add_argument(
+        "--no-search-gateway",
+        action="store_true",
+        help="不启动搜索网关（等价于 --search-gateway-port 0）。",
+    )
     args = ap.parse_args()
+
+    if args.no_search_gateway:
+        args.search_gateway_port = 0
 
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
+    CONFIG["system_prompt"] = _load_system_prompt(args.system_prompt)
+    CONFIG["system_prompt_mode"] = args.system_prompt_mode
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = (
         args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
@@ -1696,6 +1765,12 @@ def main():
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     if CONFIG["log_path"]:
         sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
+    if CONFIG["system_prompt"]:
+        preview = _truncate(CONFIG["system_prompt"], 60)
+        sys.stderr.write(
+            f"   系统提示词: [{CONFIG['system_prompt_mode']}] {preview!r}"
+            f"（{len(CONFIG['system_prompt'])} 字符）\n"
+        )
     if args.desensitize:
         mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
         sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
@@ -1704,7 +1779,55 @@ def main():
     # 启动时写一条标记
     _log("==== converter 启动 ====")
 
+    if args.search_gateway_port:
+        _start_search_gateway(args.search_gateway_port, args.host)
+
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+
+
+def _start_search_gateway(port: int, host: str) -> None:
+    """在同进程内以守护线程拉起搜索网关（失败不影响代理主功能）。
+
+    DSH 的 web_search 由宿主侧插件执行、另发一个 Anthropic Messages 请求，
+    不经过本代理的模型链路；这里顺带把那个端点也提供出来，省得单独起进程。
+    """
+    try:
+        from .search_gateway import SearchError, build_server
+    except ImportError:  # pragma: no cover - 脚本直跑时
+        try:
+            from search_gateway import SearchError, build_server  # type: ignore[no-redef]
+        except ImportError as e:
+            sys.stderr.write(f"   搜索网关  : 无法导入模块（{e}），已跳过\n")
+            return
+
+    # 绑定地址用本机回环：DSH 插件就在本机，无需对外暴露
+    bind = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    try:
+        httpd = build_server(bind, port)
+    except OSError as e:
+        # 端口占用：说明已有实例在跑（或别的程序占了）。不要静默假装成功，
+        # 否则 DSH 的搜索会被那个旧进程接走，排查起来极难。
+        sys.stderr.write(
+            f"   搜索网关  : 端口 {port} 已被占用（{e.strerror or e}），未启动。\n"
+            f"               若已有实例在跑可忽略；否则换端口："
+            f"--search-gateway-port <PORT>，并同步改 cordis.patch.yml 的 baseURL。\n"
+        )
+        return
+    except SearchError as e:
+        sys.stderr.write(f"   搜索网关  : 未启动（{e}）\n")
+        return
+    except Exception as e:  # noqa: BLE001 - 任何意外都不该拖垮代理
+        sys.stderr.write(f"   搜索网关  : 启动失败（{e}），已跳过\n")
+        return
+
+    t = threading.Thread(
+        target=httpd.serve_forever, name="search-gateway", daemon=True
+    )
+    t.start()
+    sys.stderr.write(
+        f"   搜索网关  : http://{bind}:{port}"
+        "（供 DSH web-search-deepseek.baseURL 使用）\n"
+    )
 
 
 if __name__ == "__main__":

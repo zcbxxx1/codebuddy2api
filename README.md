@@ -232,6 +232,15 @@ python3 -m core.converter --api-key mysecret
 python3 -m core.converter --port 9000
 ```
 
+启动后会同时监听两个端口：
+
+- **代理** `--port`（默认 8787）：模型协议转换。
+- **搜索网关** `--search-gateway-port`（默认 **8790**，随主服务自动启动）：
+  把 DSH 的 `web_search` 桥接到本机 WorkBuddy 登录态。不需要可关：
+  `--no-search-gateway` 或 `--search-gateway-port 0`。
+
+详见 [SEARCH_BRIDGE.md](SEARCH_BRIDGE.md)。
+
 ### 命令行参数
 
 | 参数 | 默认值 | 说明 |
@@ -242,6 +251,10 @@ python3 -m core.converter --port 9000
 | `--log` | 无 | 记录请求与响应日志 |
 | `--desensitize` | 关 | 压缩运行时提示、去掉 tool description、零宽脱敏高风险关键词 |
 | `--no-compact` | 关 | 配合 `--desensitize` 使用，保留更完整的原始 system prompt |
+| `--system-prompt` | 无 | 自定义首条 system 提示词（`@文件` 可读文件） |
+| `--system-prompt-mode` | `fallback` | `fallback` / `prepend` / `replace` |
+| `--search-gateway-port` | `8790` | 搜索网关端口；`0` 表示不启动 |
+| `--no-search-gateway` | 关 | 不启动搜索网关（等价于端口设 `0`） |
 | `--skip-check` | 否 | 跳过启动预检 |
 
 ### curl 示例
@@ -413,6 +426,9 @@ workbuddy2api/
 │   ├── responses_adapter.py   # OpenAI Responses ↔ Chat 适配
 │   ├── responses_projection.py# Codex / agent 请求投影压缩
 │   ├── anthropic_adapter.py   # Anthropic Messages ↔ Chat 适配
+│   ├── workbuddy_search.py    # 用本机 WorkBuddy 登录态搜索（/agenttool/v1/search）
+│   ├── search_gateway.py      # 本地搜索网关（Anthropic Messages 兼容，默认随主服务启动）
+│   ├── workbuddy_atrest_crypto.py # WorkBuddy 5.6+ $wbEncrypted 登录态解密
 │   └── desensitize.py         # 运行时文本压缩与零宽脱敏
 ├── admin/                     # 中文管理后台（可选，python3 -m admin.server）
 │   ├── server.py              # 管理 API、会话与静态页面
