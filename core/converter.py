@@ -1667,7 +1667,13 @@ def main():
     ap = argparse.ArgumentParser(
         description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
     )
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="监听地址，默认 127.0.0.1（仅本机可访问）。"
+        "传 0.0.0.0 可被局域网/容器访问——注意这会把你的账号额度"
+        "（含 WorkBuddy 搜索凭据）开放给同网段所有人，建议同时设置 --api-key。",
+    )
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument(
         "--api-key",
@@ -1760,11 +1766,22 @@ def main():
         mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
         sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
     if search_route:
+        # 用实际监听地址，别写死 127.0.0.1——否则 --host 0.0.0.0 时横幅会
+        # 误导成"只绑本机"，看不出搜索能力其实已对所有网卡开放。
         sys.stderr.write(
-            f"   搜索网关  : http://127.0.0.1:{args.port}{search_route}"
+            f"   搜索网关  : http://{args.host}:{args.port}{search_route}"
             "（供 DSH web-search-deepseek.baseURL 使用）\n"
         )
     sys.stderr.write("按 Ctrl+C 退出。\n\n")
+
+    # 对外监听且无鉴权：这是最容易出事的组合，必须显式警告
+    if args.host in ("0.0.0.0", "::", "::0") and not args.api_key:
+        sys.stderr.write(
+            "⚠️  正在对所有网卡监听（--host "
+            f"{args.host}）且未设置 --api-key：\n"
+            "    同网段任何人都能用你的账号跑模型、并借用 WorkBuddy 登录态搜索。\n"
+            "    若确需对外，请加 --api-key <密钥>；只想本机用请去掉 --host。\n\n"
+        )
 
     # 启动时写一条标记
     _log("==== converter 启动 ====")
