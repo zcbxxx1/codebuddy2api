@@ -35,3 +35,6 @@ wheels/
 management-access.txt
 .idea/
 
+# 本地分析报告（含账号身份信息等，仅供本机查阅，绝不提交）
+analysis-reports/
+
